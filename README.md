@@ -80,7 +80,7 @@ You can use the following commands to download and install the latest release bi
 
 ```bash
 # Note: replace the `amd64` suffix with the appropriate value under other CPU architectures
-URL="https://github.com/TensorWorks/bootnext/releases/download/v0.0.1/bootnext-linux-amd64"
+URL="https://github.com/TensorWorks/bootnext/releases/download/v0.0.2/bootnext-linux-amd64"
 sudo curl -fSL "$URL" -o /usr/local/bin/bootnext
 sudo chmod +x /usr/local/bin/bootnext
 ```
@@ -89,7 +89,7 @@ Under Windows, run the following command from an elevated command prompt or Powe
 
 ```powershell
 # Note: replace the `amd64` suffix with the appropriate value under other CPU architectures
-curl.exe -fSL "https://github.com/TensorWorks/bootnext/releases/download/v0.0.1/bootnext-windows-amd64.exe" -o "C:\Windows\System32\bootnext.exe"
+curl.exe -fSL "https://github.com/TensorWorks/bootnext/releases/download/v0.0.2/bootnext-windows-amd64.exe" -o "C:\Windows\System32\bootnext.exe"
 ```
 
 ### Portable installation
