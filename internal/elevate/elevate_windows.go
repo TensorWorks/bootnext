@@ -4,13 +4,17 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"syscall"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
 )
 
 var (
+	kernel32        = windows.NewLazyDLL("kernel32.dll")
 	shell32         = windows.NewLazyDLL("shell32.dll")
+	attachConsole   = kernel32.NewProc("AttachConsole")
+	freeConsole     = kernel32.NewProc("FreeConsole")
 	shellExecuteExW = shell32.NewProc("ShellExecuteExW")
 )
 
@@ -35,6 +39,9 @@ const (
 	_SE_ERR_DLLNOTFOUND     uint32 = 32
 )
 
+// Constant from: <https://www.pinvoke.net/default.aspx/kernel32/AttachConsole.html>
+const ATTACH_PARENT_PROCESS uint32 = 0x0ffffffff
+
 // SHELLEXECUTEINFOW structure, from: <https://learn.microsoft.com/en-us/windows/win32/api/shellapi/ns-shellapi-shellexecuteinfow>
 type _SHELLEXECUTEINFOW struct {
 	cbSize               uint32
@@ -54,6 +61,106 @@ type _SHELLEXECUTEINFOW struct {
 	hProcess             windows.Handle
 }
 
+// Detect when we are an elevated child process launched by `RunElevated()` and attach to the console of our
+// non-elevated parent process
+//
+// Note: this workaround is necessary because the elevated executable will always open in a new console window,
+// which will then close almost immediately, before the user has a chance to read any output.
+//
+// Although methods do exist for creating elevated processes that inherit the standard handles from a non-elevated
+// parent process (<https://github.com/cubiclesoft/createprocess-windows>), these workflows are excessively complex
+// and require the use of an additional executable that would need to be bundled with bootnext.
+//
+// Instead, we programmatically detect when we're the elevated child process and attach to the parent process console.
+// This workaround is inspired by the implementation of the `sudo` command in Luke Sampson's "psutils" project:
+// <https://github.com/lukesampson/psutils/blob/8af01127a949c64ea50b657989a4cd7744d4fffd/sudo.ps1#L27-L28>
+func init() {
+
+	// Don't bother checking our parent process details if we're running as a non-elevated process
+	if !IsElevated() {
+		return
+	}
+
+	// Retrieve the PID for the current process
+	currentPID := windows.GetCurrentProcessId()
+
+	// Retrieve the path to the executable for the current process
+	executable, err := os.Executable()
+	if err != nil {
+		return
+	}
+
+	// Create a snapshot of the processes currently running on the system
+	snapshot, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPPROCESS, 0)
+	if err != nil {
+		return
+	}
+
+	// Ensure the snapshot handle is closed when this function completes
+	defer windows.CloseHandle(snapshot)
+
+	// Create a `PROCESSENTRY32` struct and populate its size field
+	var processEntry windows.ProcessEntry32
+	processEntry.Size = uint32(unsafe.Sizeof(processEntry))
+
+	// Iterate over the processes in the snapshot until we find the details for the current process
+	err = windows.Process32First(snapshot, &processEntry)
+	for err == nil && processEntry.ProcessID != currentPID {
+		err = windows.Process32Next(snapshot, &processEntry)
+	}
+
+	// Verify that we found the details for the current process
+	if err != nil {
+		return
+	}
+
+	// Retrieve the PID of our parent process and attempt to open a process handle
+	// Attempt to open a handle to our parent process using its PID
+	parentProcess, err := windows.OpenProcess(windows.PROCESS_QUERY_INFORMATION|windows.PROCESS_VM_READ, true, processEntry.ParentProcessID)
+	if err != nil {
+		return
+	}
+
+	// Ensure the parent process handle is closed when this function completes
+	defer windows.CloseHandle(parentProcess)
+
+	// Retrieve the module for the parent process's executable
+	var parentModule windows.Handle
+	var bytesNeeded uint32
+	if err := windows.EnumProcessModules(parentProcess, &parentModule, uint32(unsafe.Sizeof(parentModule)), &bytesNeeded); err != nil {
+		return
+	}
+
+	// Retrieve the path to the executable for the parent process
+	const bufSize = 4096
+	var buffer [bufSize]uint16
+	if err := windows.GetModuleFileNameEx(parentProcess, parentModule, &buffer[0], bufSize); err != nil {
+		return
+	}
+
+	// If the executable paths match for the current process and the parent process then we're an elevated child process created by `RunElevated()`
+	if windows.UTF16ToString(buffer[:]) == executable {
+
+		// Detach from the console that was created for the elevated child process
+		freeConsole.Call()
+
+		// Attach to the console of the non-elevated parent process
+		attachConsole.Call(uintptr(ATTACH_PARENT_PROCESS))
+
+		// Update the standard handles in the `syscall` package
+		// (See: <https://github.com/golang/go/blob/go1.20.5/src/syscall/syscall_windows.go#L493-L495>)
+		syscall.Stdin, _ = syscall.GetStdHandle(syscall.STD_INPUT_HANDLE)
+		syscall.Stdout, _ = syscall.GetStdHandle(syscall.STD_OUTPUT_HANDLE)
+		syscall.Stderr, _ = syscall.GetStdHandle(syscall.STD_ERROR_HANDLE)
+
+		// Update the corresponding file objects in the `os` package
+		// (See: <https://github.com/golang/go/blob/go1.20.5/src/os/file.go#L65-L67>)
+		os.Stdin = os.NewFile(uintptr(syscall.Stdin), "/dev/stdin")
+		os.Stdout = os.NewFile(uintptr(syscall.Stdout), "/dev/stdout")
+		os.Stderr = os.NewFile(uintptr(syscall.Stderr), "/dev/stderr")
+	}
+}
+
 // Determines whether the current process is running with elevated privileges
 func IsElevated() bool {
 	return windows.GetCurrentProcessToken().IsElevated()
@@ -68,24 +175,9 @@ func RunElevated() (int, error) {
 		return -1, err
 	}
 
-	// Append `--pause` to our list of arguments
-	//
-	// Note: this workaround is necessary because the elevated executable will always open in a new
-	// console window, which will then close almost immediately, before the user has a chance to read
-	// any output.
-	//
-	// Although methods do exist for creating elevated processes that inherit the standard handles
-	// from a non-elevated parent process (<https://github.com/cubiclesoft/createprocess-windows>),
-	// these workflows are excessively complex and require the use of an additional executable that
-	// would need to be bundled with bootnext.
-	//
-	// Instead, we use this much simpler workaround.
-	//
-	cmdArgs := append(os.Args, "--pause")
-
-	// Escape each of the arguments
+	// Escape each of the arguments that were passed to the current process
 	escapedArgs := []string{}
-	for _, arg := range cmdArgs {
+	for _, arg := range os.Args[1:] {
 
 		// Iterate over each character in the argument
 		var builder strings.Builder
@@ -127,13 +219,13 @@ func RunElevated() (int, error) {
 	// Prepare our input struct for `ShellExecuteExW()`
 	execInfo := &_SHELLEXECUTEINFOW{
 		cbSize:               uint32(unsafe.Sizeof(_SHELLEXECUTEINFOW{})),
-		fMask:                _SEE_MASK_NOCLOSEPROCESS | _SEE_MASK_NO_CONSOLE,
+		fMask:                _SEE_MASK_NOCLOSEPROCESS,
 		hwnd:                 0,
 		lpVerb:               uintptr(unsafe.Pointer(verb)),
 		lpFile:               uintptr(unsafe.Pointer(file)),
 		lpParameters:         uintptr(unsafe.Pointer(args)),
 		lpDirectory:          0,
-		nShow:                windows.SW_SHOW,
+		nShow:                windows.SW_HIDE,
 		hInstApp:             0, // Will be set by `ShellExecuteExW()`
 		lpIDList:             0,
 		lpClass:              0,
